@@ -26,7 +26,7 @@ We recommend using the Docker images available on the [NVIDIA GPU Cloud (NGC) Ca
 ```shell
 docker run --gpus all -it --rm --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v <Your Dir>:/workspace/WLB-LLM-Context-Parallelism \
+  -v <Your Dir>:/workspace/WLB-LLM-CP \
   nvcr.io/nvidia/pytorch:25.01-py3
 ```
 
