@@ -35,7 +35,6 @@ docker run --gpus all -it --rm --ipc=host \
 ### Correctness Evaluation:
 
 ```shell
-chmod 777 run_correctness_check.sh
 ./run_correctness_check.sh
 ```
 
@@ -44,7 +43,6 @@ chmod 777 run_correctness_check.sh
 ### Performance Evaluation:
 
 ```shell
-chmod 777 run_cp_performance_compare.sh
 ./run_cp_performance_compare.sh
 ```
 
