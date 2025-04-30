@@ -1,6 +1,6 @@
 # WLB-LLM (Context Parallelism)
 
-This repository contains an open-source implementation of the `Per-Sequence CP Sharding` and `Per-Document CP Sharding` methods proposed in the paper **[OSDI'25] "WLB-LLM: Workload-Balanced 4D Parallelism for Large Language Model Training."**
+This repository contains an open-source implementation of the `Per-Sequence CP Sharding` baseline and the `Per-Document CP Sharding` methods proposed in the paper **[OSDI'25] "WLB-LLM: Workload-Balanced 4D Parallelism for Large Language Model Training."**
 
 
 ## Repository Structure
