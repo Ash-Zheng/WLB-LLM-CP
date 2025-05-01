@@ -20,6 +20,7 @@ from flash_attn.flash_attn_interface import (
 
 from utils import (
     kv_shuffle_for_per_doc_cp,
+    kv_unshuffle_for_per_doc_cp,
     compute_per_doc_cp_shard_doc_len,
 )
 
@@ -93,21 +94,20 @@ class PerDocumentCPAttention(torch.autograd.Function):
             local_ks.append(local_k)
             local_vs.append(local_v)
 
-            out, lse, *rest = _flash_attn_varlen_forward(
-                q                 = q_chunks[chunk_id],
-                k                 = local_k,
-                v                 = local_v,
-                cu_seqlens_q      = cu_seqlens_q_list[chunk_id],
-                cu_seqlens_k      = cu_seqlens_kv_list[chunk_id],
-                max_seqlen_q      = max_seqlen_q_list[chunk_id],
-                max_seqlen_k      = max_seqlen_kv_list[chunk_id],
+            out, lse, _ = flash_attn_varlen_func(
+                q=q_chunks[chunk_id],
+                k=local_k,
+                v=local_v,
+                cu_seqlens_q=cu_seqlens_q_list [chunk_id],
+                cu_seqlens_k=cu_seqlens_kv_list[chunk_id],
+                max_seqlen_q=max_seqlen_q_list [chunk_id],
+                max_seqlen_k=max_seqlen_kv_list[chunk_id],
                 dropout_p=0.0,
-                window_size=(-1, -1),
                 softmax_scale=softmax_scale,
                 causal=True,
-                return_softmax=False,
-                alibi_slopes=None,
+                return_attn_probs=True
             )
+            
             outputs.append(out)
             lses.append(lse)
 
@@ -125,6 +125,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
         ctx.kv_idx_list      = kv_idx_list
         ctx.q_chunk_sizes  = [c.shape[0] for c in q_chunks]
         ctx.dropout_p      = dropout_p
+        ctx.doc_lens       = doc_lens
+        ctx.doc_shards     = doc_shards
         ctx.softmax_scale  = softmax_scale
         ctx.attn_mask_type = attn_mask_type
         ctx.cp_group       = cp_group
@@ -153,6 +155,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         cp_group   = ctx.cp_group
         kv_idx_list = ctx.kv_idx_list 
+        doc_lens = ctx.doc_lens
+        doc_shards = ctx.doc_shards
         (qlen_L, qlen_R) = ctx.q_chunk_sizes
         world_size = get_world_size(cp_group)
         rank    = get_rank(cp_group)
@@ -167,6 +171,7 @@ class PerDocumentCPAttention(torch.autograd.Function):
 
         cp_size = get_world_size(cp_group)
         chunk_size = d_out_L.size(0)
+        context_length = chunk_size * 2 * cp_size
 
         for i, (d_out, q_len, out, lse, kv_k, kv_v, cu_q, cu_k, max_q, max_k) in enumerate([
             (d_out_L, qlen_L, out_L, lse_L, k_L, v_L, cu_q_L, cu_k_L, maxq_L, maxk_L),
@@ -199,6 +204,8 @@ class PerDocumentCPAttention(torch.autograd.Function):
                 dk_global[start:end] += dk_chunk[local_idx:local_idx + chunk_len] 
                 dv_global[start:end] += dv_chunk[local_idx:local_idx + chunk_len] 
                 local_idx += chunk_len
+
+        dk_global, dv_global = kv_unshuffle_for_per_doc_cp(context_length, dk_global, dv_global, doc_lens, doc_shards, cp_size)
  
         # now do reduce_scatter for dk/dv
         dk_local = torch.empty_like(dq_local)
@@ -206,9 +213,6 @@ class PerDocumentCPAttention(torch.autograd.Function):
         with torch.cuda.stream(ctx.cp_stream):
             dk_global = dk_global.contiguous()
             dv_global = dv_global.contiguous()
-
-            # reduce_scatter into local dk/dv
-            chunk = dk_global.size(0) // dist.get_world_size(cp_group)
 
             dist.reduce_scatter_tensor(dk_local, dk_global,
                                     op=dist.ReduceOp.SUM, group=cp_group)

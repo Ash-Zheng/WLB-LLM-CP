@@ -136,9 +136,9 @@ def compute_per_doc_metadate_combined(context_length, q, k, v, doc_lens, doc_sha
         max_seqlen_k_list.append(torch.tensor([max(kv_len_list)], dtype=torch.int32).to(q.device))
         kv_idx_list.append(kv_idx)
 
-    local_q = torch.cat(local_q_chunks, dim=0)
-    local_k = torch.cat(local_k_chunks, dim=0)
-    local_v = torch.cat(local_v_chunks, dim=0)
+    local_q = torch.cat(local_q_chunks, dim=0).clone()
+    local_k = torch.cat(local_k_chunks, dim=0).clone()
+    local_v = torch.cat(local_v_chunks, dim=0).clone()
     local_q.requires_grad_(True)
     local_k.requires_grad_(True)
     local_v.requires_grad_(True)
@@ -180,13 +180,13 @@ def get_per_doc_local_result(context_length, global_result, doc_lens, doc_shards
 
     return local_result
 
-def per_doc_correctness_evaluate(global_out_ref, local_out, context_length, cp_size, rank, doc_lens, doc_shards):
+def per_doc_correctness_evaluate(global_out_ref, local_out, context_length, cp_size, rank, doc_lens, doc_shards, rtol=None, atol=None):
     out_chunks = []
     for chunk_id in range(2):
         chunk_result = get_per_doc_local_result(context_length, global_out_ref, doc_lens, doc_shards, cp_size, rank, chunk_id)
         out_chunks.append(chunk_result)
     ref_local_out = torch.cat(out_chunks, dim=0)
-    torch.testing.assert_close(ref_local_out, local_out)
+    torch.testing.assert_close(ref_local_out, local_out, rtol=rtol, atol=atol)
 
 def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_lens, doc_shards, cp_size):
     """
@@ -236,6 +236,35 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
     assert shuffled_k_tensor.shape[0] == context_length, f"shuffled_k_tensor shape {shuffled_k_tensor.shape[0]} must equals context length {context_length}."
                     
     return shuffled_k_tensor, shuffled_v_tensor
+
+def kv_unshuffle_for_per_doc_cp(context_length, k_tensor, v_tensor, doc_lens, doc_shards, cp_size):
+    """
+    Unshuffle the kv tensor for reducescatter in the per-doc backward.
+    """
+    chunk_size = context_length // (2 * cp_size)
+    global_k = []
+    global_v = []
+    global_cu_lens =  [0] + list(accumulate(doc_lens))
+    for rank in range(cp_size):
+        for chunk_id in range(2):
+            if chunk_id == 0:
+                chunk_index = rank
+            else:
+                chunk_index = 2 * cp_size - 1 - rank
+
+            this_doc_shards = doc_shards[chunk_index]
+            offset = 0
+
+            for doc_shard_i in this_doc_shards:
+                if doc_shard_i is None:
+                    continue
+                else:
+                    chunk_start = global_cu_lens[doc_shard_i.doc_id] + doc_shard_i.prefix_len
+                    chunk_end = chunk_start + doc_shard_i.shard_len
+                    global_k.append(k_tensor[chunk_start:chunk_end, :, :]) # qkv input should have the same format
+                    global_v.append(v_tensor[chunk_start:chunk_end, :, :])
+                    
+    return torch.cat(global_k, dim=0), torch.cat(global_v, dim=0)
 
 # ================= Per-Seq CP Sharding =================
 def compute_per_seq_metadate_combined(context_length, q_tensor, k_tensor, v_tensor, doc_lens, cp_size, rank, d_out=None):
@@ -340,11 +369,11 @@ def compute_per_seq_metadate_combined(context_length, q_tensor, k_tensor, v_tens
 
     return local_q, local_k, local_v, cu_seqlens_q_list, cu_seqlens_k_list, max_seqlen_q_list, max_seqlen_k_list, k_offset_list, local_d_out
 
-def per_seq_correctness_evaluate(global_out_ref, local_out, context_length, cp_size, rank):
+def per_seq_correctness_evaluate(global_out_ref, local_out, context_length, cp_size, rank, rtol=None, atol=None):
     chunk_size = context_length // (2 * cp_size)
     out_chunks = global_out_ref.chunk(2 * cp_size, dim=0)
     ref_local_out = torch.cat([out_chunks[rank], out_chunks[2 * cp_size - 1 - rank]], dim=0)
-    torch.testing.assert_close(ref_local_out, local_out)
+    torch.testing.assert_close(ref_local_out, local_out, rtol=rtol, atol=atol)
 
 # ================= Others =================
 def generate_doc_lens(avg_doc_len, std_doc_len, context_length, divide_cp=1):

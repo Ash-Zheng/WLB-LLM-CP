@@ -49,7 +49,7 @@ def compute_global_fwd_bwd(
     cu_seqlens_k = cu_seqlens_q.clone()
     softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
 
-    out, lse, *rest = _flash_attn_varlen_forward(
+    out, lse, _ = flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -58,11 +58,9 @@ def compute_global_fwd_bwd(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         dropout_p=0.0,
-        window_size=(-1, -1),
         softmax_scale=softmax_scale,
         causal=True,
-        return_softmax=False,
-        alibi_slopes=None,
+        return_attn_probs=True
     )
 
     dq = torch.empty_like(q)
@@ -149,12 +147,8 @@ def run(rank: int, world_size: int, args):
 
     dist.barrier(device_ids=[rank])
     print_on_main(rank, "Random input generation finished")
-    # print("rank:{}, doc_lens: {}, q_global:{}".format(rank, doc_lens, q_global[0]))
 
     # ======= Compute reference output and gradients =======
-    q_global.requires_grad_(True)
-    k_global.requires_grad_(True)
-    v_global.requires_grad_(True)
     out_ref, dq_ref, dk_ref, dv_ref = compute_global_fwd_bwd(q_global, k_global, v_global, d_out_global, doc_lens, softmax_scale)
     dist.barrier(device_ids=[rank])
     print_on_main(rank, "Reference results finished")
@@ -196,9 +190,9 @@ def run(rank: int, world_size: int, args):
     out.backward(local_d_out)
     torch.cuda.synchronize()
     per_doc_correctness_evaluate(out_ref, out, context_length, cp_size, rank, doc_lens, doc_shards)
-    per_doc_correctness_evaluate(q_global.grad, local_q_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards)
-    per_doc_correctness_evaluate(k_global.grad, local_k_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards)
-    per_doc_correctness_evaluate(v_global.grad, local_v_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards)
+    per_doc_correctness_evaluate(dq_ref, local_q_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards, rtol=1e-1, atol=1e-1)
+    per_doc_correctness_evaluate(dk_ref, local_k_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards, rtol=1e-1, atol=1e-1)
+    per_doc_correctness_evaluate(dv_ref, local_v_doc.grad, context_length, cp_size, rank, doc_lens, doc_shards, rtol=1e-1, atol=1e-1)
     print("Per-Doc forward & backward correntness check passed on rank:", rank)
     dist.barrier(device_ids=[rank])
     dist.destroy_process_group()

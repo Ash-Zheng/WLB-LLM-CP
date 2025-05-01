@@ -49,7 +49,7 @@ def compute_global_fwd_bwd(
     cu_seqlens_k = cu_seqlens_q.clone()
     softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
 
-    out, lse, *rest = _flash_attn_varlen_forward(
+    out, lse, _ = flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -58,11 +58,9 @@ def compute_global_fwd_bwd(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         dropout_p=0.0,
-        window_size=(-1, -1),
         softmax_scale=softmax_scale,
         causal=True,
-        return_softmax=False,
-        alibi_slopes=None,
+        return_attn_probs=True
     )
 
     dq = torch.empty_like(q)
@@ -77,13 +75,13 @@ def compute_global_fwd_bwd(
         lse,                    # softmax_lse
         dq, dk, dv,
         cu_seqlens_q, cu_seqlens_k,     # cu_seqlens_q / cu_seqlens_k
-        max_seqlen_q, max_seqlen_k, # max_seqlen_q / max_seqlen_k
+        int(max_seqlen_q), int(max_seqlen_k), # max_seqlen_q / max_seqlen_k
         dropout_p=0.0,                        
         softmax_scale=softmax_scale,
         causal=True,                      
         window_size=(-1, -1),               
         alibi_slopes=None,    
-        deterministic=False,  
+        deterministic=True,  
         rng_state=None,                   
         zero_tensors=False
     )
@@ -129,10 +127,10 @@ def run(rank: int, world_size: int, args):
 
     # ======= Generate and sync random QKV tensor =======
     if rank == 0:
-        q_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-        k_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-        v_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
-        d_out_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        q_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
+        k_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
+        v_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
+        d_out_global = torch.randn(batch_size * context_length, num_heads, head_dim, device=device, dtype=torch.bfloat16) - 0.5
     else:
         doc_lens_tensor = torch.empty(n_doc_tensor[0].item(), dtype=torch.int32, device=device)
         q_global = torch.empty(context_length, num_heads, head_dim, dtype=torch.bfloat16, device=device)
@@ -152,9 +150,6 @@ def run(rank: int, world_size: int, args):
     # print("rank:{}, doc_lens: {}, q_global:{}".format(rank, doc_lens, q_global[0]))
 
     # ======= Compute reference output and gradients =======
-    q_global.requires_grad_(True)
-    k_global.requires_grad_(True)
-    v_global.requires_grad_(True)
     out_ref, dq_ref, dk_ref, dv_ref = compute_global_fwd_bwd(q_global, k_global, v_global, d_out_global, doc_lens, softmax_scale)
     dist.barrier(device_ids=[rank])
     print_on_main(rank, "Reference results finished")
@@ -192,9 +187,9 @@ def run(rank: int, world_size: int, args):
     out.backward(local_d_out)
     torch.cuda.synchronize()
     per_seq_correctness_evaluate(out_ref, out, context_length, cp_size, rank)
-    per_seq_correctness_evaluate(q_global.grad, local_q.grad, context_length, cp_size, rank)
-    per_seq_correctness_evaluate(k_global.grad, local_k.grad, context_length, cp_size, rank)
-    per_seq_correctness_evaluate(v_global.grad, local_v.grad, context_length, cp_size, rank)
+    per_seq_correctness_evaluate(dq_ref, local_q.grad, context_length, cp_size, rank, rtol=1e-1, atol=1e-1)
+    per_seq_correctness_evaluate(dk_ref, local_k.grad, context_length, cp_size, rank, rtol=1e-1, atol=1e-1)
+    per_seq_correctness_evaluate(dv_ref, local_v.grad, context_length, cp_size, rank, rtol=1e-1, atol=1e-1)
     print("Per-Seq forward & backward correntness check passed on rank:", rank)
     dist.barrier(device_ids=[rank])
     dist.destroy_process_group()

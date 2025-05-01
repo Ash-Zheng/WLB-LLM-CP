@@ -119,6 +119,7 @@ class PerSequenceCPAttention(torch.autograd.Function):
 
         # compute forward pass
         outputs, lses = [], []
+        local_ks, local_vs = [], []
         q_chunks = local_q.chunk(2, dim=0)
         for chunk_id in range(2):  # 0, 1
             if chunk_id == 0:
@@ -130,20 +131,21 @@ class PerSequenceCPAttention(torch.autograd.Function):
             local_k_slice = k_global[k_start:k_end]
             local_v_slice = v_global[k_start:k_end]
 
-            out, lse, *rest = _flash_attn_varlen_forward(
-                q                 = q_chunks[chunk_id],
-                k                 = local_k_slice,
-                v                 = local_v_slice,
-                cu_seqlens_q      = cu_seqlens_q_list [chunk_id],
-                cu_seqlens_k      = cu_seqlens_kv_list[chunk_id],
-                max_seqlen_q      = max_seqlen_q_list [chunk_id],
-                max_seqlen_k      = max_seqlen_kv_list[chunk_id],
+            local_ks.append(local_k_slice)
+            local_vs.append(local_v_slice)
+
+            out, lse, _ = flash_attn_varlen_func(
+                q=q_chunks[chunk_id],
+                k=local_k_slice,
+                v=local_v_slice,
+                cu_seqlens_q=cu_seqlens_q_list [chunk_id],
+                cu_seqlens_k=cu_seqlens_kv_list[chunk_id],
+                max_seqlen_q=max_seqlen_q_list [chunk_id],
+                max_seqlen_k=max_seqlen_kv_list[chunk_id],
                 dropout_p=0.0,
-                window_size=(-1, -1),
                 softmax_scale=softmax_scale,
                 causal=True,
-                return_softmax=False,
-                alibi_slopes=None,
+                return_attn_probs=True
             )
 
             outputs.append(out)
@@ -157,6 +159,8 @@ class PerSequenceCPAttention(torch.autograd.Function):
             k_global, v_global,
             *outputs,             
             *lses,
+            *local_ks,
+            *local_vs,
             *cu_seqlens_q_list, *cu_seqlens_kv_list,
             *max_seqlen_q_list, *max_seqlen_kv_list,
         )
@@ -184,6 +188,8 @@ class PerSequenceCPAttention(torch.autograd.Function):
             gathered_k, gathered_v,
             out_L, out_R, 
             lse_L, lse_R,
+            k_L, k_R,
+            v_L, v_R,
             cu_q_L, cu_q_R, cu_k_L, cu_k_R,
             maxq_L, maxq_R, maxk_L, maxk_R,
         ) = ctx.saved_tensors
@@ -206,9 +212,13 @@ class PerSequenceCPAttention(torch.autograd.Function):
         chunk_size = d_out_L.size(0)
 
         # compute dq and dk/dv for each chunk
-        for i, (d_out, q_len, out, lse, cu_q, cu_k, max_q, max_k) in enumerate([
-            (d_out_L, qlen_L, out_L, lse_L, cu_q_L, cu_k_L, maxq_L, maxk_L),
-            (d_out_R, qlen_R, out_R, lse_R, cu_q_R, cu_k_R, maxq_R, maxk_R),
+        # for i, (d_out, q_len, out, lse, cu_q, cu_k, max_q, max_k) in enumerate([
+        #     (d_out_L, qlen_L, out_L, lse_L, cu_q_L, cu_k_L, maxq_L, maxk_L),
+        #     (d_out_R, qlen_R, out_R, lse_R, cu_q_R, cu_k_R, maxq_R, maxk_R),
+        # ]):
+        for i, (d_out, q_len, out, lse, kv_k, kv_v, cu_q, cu_k, max_q, max_k) in enumerate([
+            (d_out_L, qlen_L, out_L, lse_L, k_L, v_L, cu_q_L, cu_k_L, maxq_L, maxk_L),
+            (d_out_R, qlen_R, out_R, lse_R, k_R, v_R, cu_q_R, cu_k_R, maxq_R, maxk_R),
         ]):
             if i == 0:
                 chunk_index = rank
@@ -216,13 +226,11 @@ class PerSequenceCPAttention(torch.autograd.Function):
                 chunk_index = 2 * cp_size - 1 - rank
             k_start = int(k_offsets[i])
             k_end = (chunk_index+1) * chunk_size
-            kv_k    = gathered_k[k_start : k_end]
-            kv_v    = gathered_v[k_start : k_end]
 
             dq_chunk = torch.zeros_like(local_q[:q_len])
             dk_chunk = torch.zeros_like(kv_k)
             dv_chunk = torch.zeros_like(kv_v)
-
+            
             _ = _flash_attn_varlen_backward(
                 d_out,
                 local_q[ sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[:i+1]) ],
@@ -237,6 +245,9 @@ class PerSequenceCPAttention(torch.autograd.Function):
             dq_local[ sum(ctx.q_chunk_sizes[:i]) : sum(ctx.q_chunk_sizes[:i+1]) ] = dq_chunk
             dk_global[k_start : k_end] += dk_chunk
             dv_global[k_start : k_end] += dv_chunk
+        
+        # shuffle dk_global, dv_global
+        dk_global, dv_global = per_seq_kv_shuffle(dk_global, dv_global, cp_size)
 
         # now do reduce_scatter for dk/dv
         dk_local = torch.empty_like(dq_local)
@@ -244,9 +255,6 @@ class PerSequenceCPAttention(torch.autograd.Function):
         with torch.cuda.stream(ctx.cp_stream):
             dk_global = dk_global.contiguous()
             dv_global = dv_global.contiguous()
-
-            # reduce_scatter into local dk/dv
-            chunk = dk_global.size(0) // dist.get_world_size(cp_group)
 
             dist.reduce_scatter_tensor(dk_local, dk_global,
                                     op=dist.ReduceOp.SUM, group=cp_group)
